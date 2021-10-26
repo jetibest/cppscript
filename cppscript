@@ -1,0 +1,119 @@
+#!/bin/sh
+
+COMPILER=g++
+COMPILER_FLAGS=(-std=c++17 -Wall)
+LINKER=g++
+LINKER_FLAGS=(-I /usr/include -I ./include -L /usr/lib -L ./lib)
+
+CACHE_PATH="./cache"
+MAIN_BINARY="${CACHE_PATH:-.}/main"
+VERBOSE=false
+
+# exit upon any error
+set -e
+
+# grab the file we want to run
+original_input_file="$1"
+shift
+
+# check input parameters
+if ! [ -f "$original_input_file" ]
+then
+    echo "File does not exist ($original_input_file)." >&2
+    exit 1
+fi
+
+# ensure cache directory exists
+mkdir -p "$CACHE_PATH"
+
+# initialize arrays for automatic searching for libraries and includes
+input_files=("${original_input_file#./}")
+object_files=()
+global_includes=()
+
+# do the compilation loop
+i=0
+while [ "$i" -lt "${#input_files[@]}" ]
+do
+    input_file="${input_files[$i]}"
+    
+    object_file="${input_file%.*}.o"
+    object_file="${CACHE_PATH:-.}/${object_file//\//--}"
+    
+    # only if last modified of input_file > object_file
+    if ! [ -f "$object_file" ] || [ "$(date -r "$input_file" '+%s%N')" -gt "$(date -r "$object_file" '+%s%N')" ]
+    then
+        $VERBOSE && echo "info: compiling $input_file to $object_file..." >&2
+        
+        sed '1s/^#!.*//' "$input_file" | "$COMPILER" "${COMPILER_FLAGS[@]}" -x c++ -c - -o "$object_file"
+    fi
+    
+    # add to object list for linker
+    object_files+=("$object_file")
+
+    # now check all the local includes in the input_file
+    local_includes=($(sed -n -r -e 's/^#include "([^"]+)"/\1/gp' "$input_file"))
+    
+    for include_file in "${local_includes[@]}"
+    do
+        # every header is considered for its linker libraries that it includes
+        # now check the global includes for dynamically linking libraries
+        # global_includes+=($(sed -n -r -e 's/^#include <([^"]+)>/\1/gp' "$include_file"))
+        global_includes=($({ sed -n -r -e 's/^#include <([^"]+)>/\1/gp' "$include_file"; printf '%s\n' "${global_includes[@]}"; } | sort -u))
+        
+        extra_input_file="${include_file%.*}.cpp"
+        
+        if [ -f "$extra_input_file" ]
+        then
+            # check if not already in list
+            exists=false
+            for f in "${input_files[@]}"
+            do
+                if [ "$f" = "$extra_input_file" ]
+                then
+                    exists=true
+                    break
+                fi
+            done
+            
+            if ! $exists
+            then
+                $VERBOSE && echo "info: found local include: $extra_input_file" >&2
+                
+                # add this file to the list for compilation and include-checking
+                input_files+=("$extra_input_file")
+            fi
+        else
+            $VERBOSE && echo "warning: No matching source-file found for included header ($include_file)." >&2
+        fi
+    done
+    
+    # also consider linker libraries in cpp files:
+    # now check the global includes for dynamically linking libraries
+    global_includes=($({ sed -n -r -e 's/^#include <([^"]+)>/\1/gp' "$input_file"; printf '%s\n' "${global_includes[@]}"; } | sort -u))
+    
+    i=$((i + 1))
+done
+
+# do the linking, but only if any object file was compiled
+if ! [ -f "$MAIN_BINARY" ] || [ -n "$(find "${CACHE_PATH:-.}" -name '*.o' -newer "$MAIN_BINARY")" ]
+then
+    linker_lib_args=()
+    for f in "${global_includes[@]}"
+    do
+        if [ "$f" = "thread" ]
+        then
+            # special library handling, see: https://stackoverflow.com/questions/23250863/difference-between-pthread-and-lpthread-while-compiling
+            linker_lib_args+=(-lpthread)
+        else
+            linker_lib_args+=($(pkg-config --libs "$f" 2>/dev/null || true))
+        fi
+    done
+    
+    $VERBOSE && echo "info: generating executable (linker)" >&2
+    "$LINKER" "${LINKER_FLAGS[@]}" "${linker_lib_args[@]}" -o "$MAIN_BINARY" "${object_files[@]}"
+fi
+
+# execute main
+exec "$MAIN_BINARY" "$@"
+
